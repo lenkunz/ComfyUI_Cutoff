@@ -50,7 +50,13 @@ def unpad_prompt(end_token, prompt):
 class CLIPRegionsBasePrompt:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {"text": ("STRING", {"multiline": True}), "clip": ("CLIP", )}}
+        return {
+            "required": {
+                "text": ("STRING", {"multiline": True}), 
+                "clip": ("CLIP", )
+            }
+        }
+
     RETURN_TYPES = ("CLIPREGION",)
     FUNCTION = "init_prompt"
 
@@ -72,6 +78,163 @@ def get_sublists(super_list, sub_list):
     if super_list[candidate_ind:candidate_ind+len(sub_list)] == sub_list:
       positions.append(candidate_ind)
   return positions
+
+class CLIPSetRegionHold:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "region_text": ("STRING", {"multiline": True}),
+                "target_text": ("STRING", {"multiline": False}), 
+                "weight": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.05})
+            },
+            "optional": {
+                "clip_regions_hold": ("CLIPREGION_HOLD", ),
+            },
+        }
+
+    RETURN_TYPES = ("CLIPREGION_HOLD",)
+    FUNCTION = "add_clip_region_hold"
+
+    CATEGORY = "conditioning/cutoff/hold"
+
+    def add_clip_region_hold(self, region_text, target_text, weight, clip_regions_hold):
+        if clip_regions_hold is None:
+            clip_regions_hold = []
+        else:
+            clip_regions_hold = clip_regions_hold.copy()
+
+        clip_regions_hold.append({
+            "region_text": region_text,
+            "target_text": target_text,
+            "weight": weight,
+        })
+
+        return (clip_regions_hold)
+
+class CLIPSetRegionFromHold:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "clip_regions_hold": ("CLIPREGION_HOLD", ),
+                "text": ("STRING", {"multiline": True}), 
+                "clip": ("CLIP", ),
+            },
+        }
+
+    RETURN_TYPES = ("CLIPREGION",)
+    FUNCTION = "add_clip_region"
+
+    CATEGORY = "conditioning/cutoff/hold"
+
+    def add_clip_region_hold(self, clip_regions_hold, text, clip):
+        if clip_regions_hold is None:
+            clip_regions_hold = []
+
+        clip_regions, = self.init_prompt(clip, text)
+        for clip_region_hold in clip_regions_hold:
+            clip_regions, = self.apply_hold_region(
+                clip_regions, 
+                clip_region_hold["region_text"],
+                clip_region_hold["target_text"],
+                clip_region_hold["weight"],
+            )
+
+        return (clip_regions)
+    
+    def init_prompt(self, clip, text):
+        tokens = clip.tokenize(text, return_word_ids=True)
+        return ({
+            "clip" : clip,
+            "base_tokens" : tokens,
+            "regions" : [],
+            "targets" : [],
+            "weights" : [],
+        },)
+    
+    def apply_hold_region(self, clip_regions, region_text, target_text, weight):
+        clip = clip_regions["clip"]
+        tokenizer = clip.tokenizer
+        base_tokens = clip_regions["base_tokens"]
+        if 'g' in base_tokens:
+            base_tokens = base_tokens['g']
+        elif 'l' in base_tokens:
+            base_tokens = base_tokens['l']
+        else:
+            raise Exception("No recognized tokenizer")
+        if hasattr(tokenizer, 'clip_g'):
+            tokenizer = tokenizer.clip_g
+        elif hasattr(tokenizer, 'clip_l'):
+            tokenizer = tokenizer.clip_l
+        else:
+            raise Exception("No recognized tokenizer")
+        region_outputs = []
+        target_outputs = []
+
+        #strip input strings
+        region_text = region_text.strip()
+        target_text = target_text.strip()
+        
+        endtoken = tokenizer.end_token
+
+        prompt_tokens, emb_lookup = replace_embeddings(endtoken, base_tokens)
+        
+        if len(region_text) != 0:
+            for rt in region_text.split('\n'):
+                region_tokens = tokenizer.tokenize_with_weights(rt)
+                region_tokens, _ = replace_embeddings(endtoken, region_tokens, emb_lookup)
+                region_tokens = unpad_prompt(endtoken, region_tokens).tolist()
+
+                #calc region mask
+                region_length = len(region_tokens)
+                regions = get_sublists(list(prompt_tokens), region_tokens)
+
+                region_mask = np.zeros(len(prompt_tokens))
+                for r in regions:
+                    region_mask[r:r+region_length] = 1
+                region_mask = region_mask.reshape(-1,tokenizer.max_length-2)
+                region_mask = np.pad(region_mask, pad_width=((0,0),(1,1)), mode='constant', constant_values=0)
+                region_mask = region_mask.reshape(1, -1)
+                region_outputs.append(region_mask)
+
+                #calc target mask
+                targets = []
+                for target in target_text.split(" "):
+                    # deal with underscores
+                    target = re.sub(r"(?<!\\)_", " ", target)
+                    target = re.sub(r"\\_", "_", target)
+
+                    target_tokens = tokenizer.tokenize_with_weights(target)
+                    target_tokens, _ = replace_embeddings(endtoken, target_tokens, emb_lookup)
+                    target_tokens = unpad_prompt(endtoken, target_tokens).tolist()
+
+                    targets.extend([(x, len(target_tokens)) for x in get_sublists(region_tokens, target_tokens)])
+                targets = [(t_start + r, t_start + t_end + r) for r in regions for t_start, t_end in targets]
+
+                targets_mask = np.zeros(len(prompt_tokens))
+                for t_start, t_end in targets:
+                    targets_mask[t_start: t_end] = 1
+                targets_mask = targets_mask.reshape(-1,tokenizer.max_length-2)
+                targets_mask = np.pad(targets_mask, pad_width=((0,0),(1,1)), mode='constant', constant_values=0)
+                targets_mask = targets_mask.reshape(1,-1)
+                target_outputs.append(targets_mask)
+
+        #prepare output
+        region_mask_list = clip_regions['regions']
+        region_mask_list.extend(region_outputs)
+        target_mask_list = clip_regions['targets']
+        target_mask_list.extend(target_outputs)
+        weight_list = clip_regions['weights']
+        weight_list.extend([weight]*len(region_outputs))
+
+        return ({
+            "clip" : clip,
+            "base_tokens" : clip_regions["base_tokens"],
+            "regions" : region_mask_list,
+            "targets" : target_mask_list,
+            "weights" : weight_list,
+        },)
 
 class CLIPSetRegion:
     @classmethod
@@ -167,6 +330,7 @@ class CLIPSetRegion:
             "targets" : target_mask_list,
             "weights" : weight_list,
         },)
+    
 def create_masked_prompt(weighted_tokens, mask, mask_token):
     if isinstance(weighted_tokens, dict):
         result = dict()
@@ -305,6 +469,8 @@ NODE_CLASS_MAPPINGS = {
     "BNK_CutoffSetRegions": CLIPSetRegion,
     "BNK_CutoffRegionsToConditioning": CLIPRegionsToConditioning,
     "BNK_CutoffRegionsToConditioning_ADV": CLIPRegionsToConditioningADV,
+    "BNK_CLIPSetRegionHold": CLIPSetRegionHold,
+    "BNK_CLIPSetRegionFromHold": CLIPSetRegionFromHold,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -312,4 +478,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "BNK_CutoffSetRegions": "Cutoff Set Regions",
     "BNK_CutoffRegionsToConditioning": "Cutoff Regions To Conditioning",
     "BNK_CutoffRegionsToConditioning_ADV": "Cutoff Regions To Conditioning (ADV)",
+    "BNK_CLIPSetRegionHold": "Cutoff Prepare Regions (Hold)",
+    "BNK_CLIPSetRegionFromHold": "Cutoff Set Regions (from Hold)",
 }
