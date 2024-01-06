@@ -98,7 +98,7 @@ class CLIPSetRegionHold:
 
     CATEGORY = "conditioning/cutoff/hold"
 
-    def add_clip_region_hold(self, region_text, target_text, weight, clip_regions_hold):
+    def add_clip_region_hold(self, region_text, target_text, weight, clip_regions_hold=None):
         if clip_regions_hold is None:
             clip_regions_hold = []
         else:
