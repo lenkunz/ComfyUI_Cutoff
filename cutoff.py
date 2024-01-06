@@ -85,7 +85,7 @@ class CLIPSetRegionHold:
         return {
             "required": {
                 "region_text": ("STRING", {"multiline": True}),
-                "target_text": ("STRING", {"multiline": False}), 
+                "target_text": ("STRING", {"multiline": True}), 
                 "weight": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.05})
             },
             "optional": {
@@ -112,7 +112,7 @@ class CLIPSetRegionHold:
 
         return (clip_regions_hold)
 
-class CLIPSetRegionFromHold:
+class CLIPRegionsFromHoldToConditioning:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -120,17 +120,27 @@ class CLIPSetRegionFromHold:
                 "clip_regions_hold": ("CLIPREGION_HOLD", ),
                 "text": ("STRING", {"multiline": True}), 
                 "clip": ("CLIP", ),
+                "mask_token": ("STRING", {"multiline": False, "default" : ""}),
+                "strict_mask": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "start_from_masked": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "token_normalization": (["none", "mean", "length", "length+mean"],),
+                "weight_interpretation": (["comfy", "A1111", "compel", "comfy++"],),
             },
         }
 
-    RETURN_TYPES = ("CLIPREGION",)
-    FUNCTION = "add_clip_region"
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "clip_region_hold_to_conditioning"
 
     CATEGORY = "conditioning/cutoff/hold"
 
-    def add_clip_region_hold(self, clip_regions_hold, text, clip):
+    def clip_region_hold_to_conditioning(
+            self, clip_regions_hold, text, clip,
+            mask_token, strict_mask, start_from_masked, token_normalization, weight_interpretation
+        ):
         if clip_regions_hold is None:
             clip_regions_hold = []
+        else:
+            clip_region_hold = clip_region_hold.copy()
 
         clip_regions, = self.init_prompt(clip, text)
         for clip_region_hold in clip_regions_hold:
@@ -141,7 +151,11 @@ class CLIPSetRegionFromHold:
                 clip_region_hold["weight"],
             )
 
-        return (clip_regions)
+        return finalize_clip_regions(
+            clip_regions, mask_token, strict_mask, 
+            start_from_masked, token_normalization, weight_interpretation
+        )
+
     
     def init_prompt(self, clip, text):
         tokens = clip.tokenize(text, return_word_ids=True)
@@ -174,51 +188,52 @@ class CLIPSetRegionFromHold:
 
         #strip input strings
         region_text = region_text.strip()
-        target_text = target_text.strip()
+        target_texts = target_text.strip()
         
         endtoken = tokenizer.end_token
 
         prompt_tokens, emb_lookup = replace_embeddings(endtoken, base_tokens)
         
-        if len(region_text) != 0:
-            for rt in region_text.split('\n'):
-                region_tokens = tokenizer.tokenize_with_weights(rt)
-                region_tokens, _ = replace_embeddings(endtoken, region_tokens, emb_lookup)
-                region_tokens = unpad_prompt(endtoken, region_tokens).tolist()
+        if len(region_text) != 0 and len(target_text) != 0:
+            for target_text in target_texts.split('\n'):
+                for rt in region_text.split('\n'):
+                    region_tokens = tokenizer.tokenize_with_weights(rt)
+                    region_tokens, _ = replace_embeddings(endtoken, region_tokens, emb_lookup)
+                    region_tokens = unpad_prompt(endtoken, region_tokens).tolist()
 
-                #calc region mask
-                region_length = len(region_tokens)
-                regions = get_sublists(list(prompt_tokens), region_tokens)
+                    #calc region mask
+                    region_length = len(region_tokens)
+                    regions = get_sublists(list(prompt_tokens), region_tokens)
 
-                region_mask = np.zeros(len(prompt_tokens))
-                for r in regions:
-                    region_mask[r:r+region_length] = 1
-                region_mask = region_mask.reshape(-1,tokenizer.max_length-2)
-                region_mask = np.pad(region_mask, pad_width=((0,0),(1,1)), mode='constant', constant_values=0)
-                region_mask = region_mask.reshape(1, -1)
-                region_outputs.append(region_mask)
+                    region_mask = np.zeros(len(prompt_tokens))
+                    for r in regions:
+                        region_mask[r:r+region_length] = 1
+                    region_mask = region_mask.reshape(-1,tokenizer.max_length-2)
+                    region_mask = np.pad(region_mask, pad_width=((0,0),(1,1)), mode='constant', constant_values=0)
+                    region_mask = region_mask.reshape(1, -1)
+                    region_outputs.append(region_mask)
 
-                #calc target mask
-                targets = []
-                for target in target_text.split(" "):
-                    # deal with underscores
-                    target = re.sub(r"(?<!\\)_", " ", target)
-                    target = re.sub(r"\\_", "_", target)
+                    #calc target mask
+                    targets = []
+                    for target in target_text.split(" "):
+                        # deal with underscores
+                        target = re.sub(r"(?<!\\)_", " ", target)
+                        target = re.sub(r"\\_", "_", target)
 
-                    target_tokens = tokenizer.tokenize_with_weights(target)
-                    target_tokens, _ = replace_embeddings(endtoken, target_tokens, emb_lookup)
-                    target_tokens = unpad_prompt(endtoken, target_tokens).tolist()
+                        target_tokens = tokenizer.tokenize_with_weights(target)
+                        target_tokens, _ = replace_embeddings(endtoken, target_tokens, emb_lookup)
+                        target_tokens = unpad_prompt(endtoken, target_tokens).tolist()
 
-                    targets.extend([(x, len(target_tokens)) for x in get_sublists(region_tokens, target_tokens)])
-                targets = [(t_start + r, t_start + t_end + r) for r in regions for t_start, t_end in targets]
+                        targets.extend([(x, len(target_tokens)) for x in get_sublists(region_tokens, target_tokens)])
+                    targets = [(t_start + r, t_start + t_end + r) for r in regions for t_start, t_end in targets]
 
-                targets_mask = np.zeros(len(prompt_tokens))
-                for t_start, t_end in targets:
-                    targets_mask[t_start: t_end] = 1
-                targets_mask = targets_mask.reshape(-1,tokenizer.max_length-2)
-                targets_mask = np.pad(targets_mask, pad_width=((0,0),(1,1)), mode='constant', constant_values=0)
-                targets_mask = targets_mask.reshape(1,-1)
-                target_outputs.append(targets_mask)
+                    targets_mask = np.zeros(len(prompt_tokens))
+                    for t_start, t_end in targets:
+                        targets_mask[t_start: t_end] = 1
+                    targets_mask = targets_mask.reshape(-1,tokenizer.max_length-2)
+                    targets_mask = np.pad(targets_mask, pad_width=((0,0),(1,1)), mode='constant', constant_values=0)
+                    targets_mask = targets_mask.reshape(1,-1)
+                    target_outputs.append(targets_mask)
 
         #prepare output
         region_mask_list = clip_regions['regions']
@@ -470,7 +485,7 @@ NODE_CLASS_MAPPINGS = {
     "BNK_CutoffRegionsToConditioning": CLIPRegionsToConditioning,
     "BNK_CutoffRegionsToConditioning_ADV": CLIPRegionsToConditioningADV,
     "BNK_CLIPSetRegionHold": CLIPSetRegionHold,
-    "BNK_CLIPSetRegionFromHold": CLIPSetRegionFromHold,
+    "BNK_CLIPRegionsFromHoldToConditioning": CLIPRegionsFromHoldToConditioning,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -479,5 +494,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "BNK_CutoffRegionsToConditioning": "Cutoff Regions To Conditioning",
     "BNK_CutoffRegionsToConditioning_ADV": "Cutoff Regions To Conditioning (ADV)",
     "BNK_CLIPSetRegionHold": "Cutoff Prepare Regions (Hold)",
-    "BNK_CLIPSetRegionFromHold": "Cutoff Set Regions (from Hold)",
+    "BNK_CLIPRegionsFromHoldToConditioning": "Cutoff Regions To Conditioning (ADV, Hold)",
 }
