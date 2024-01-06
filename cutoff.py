@@ -107,50 +107,50 @@ class CLIPSetRegion:
         #strip input strings
         region_text = region_text.strip()
         target_text = target_text.strip()
-
         
         endtoken = tokenizer.end_token
 
         prompt_tokens, emb_lookup = replace_embeddings(endtoken, base_tokens)
         
-        for rt in region_text.split('\n'):
-            region_tokens = tokenizer.tokenize_with_weights(rt)
-            region_tokens, _ = replace_embeddings(endtoken, region_tokens, emb_lookup)
-            region_tokens = unpad_prompt(endtoken, region_tokens).tolist()
+        if len(region_text) != 0:
+            for rt in region_text.split('\n'):
+                region_tokens = tokenizer.tokenize_with_weights(rt)
+                region_tokens, _ = replace_embeddings(endtoken, region_tokens, emb_lookup)
+                region_tokens = unpad_prompt(endtoken, region_tokens).tolist()
 
-            #calc region mask
-            region_length = len(region_tokens)
-            regions = get_sublists(list(prompt_tokens), region_tokens)
+                #calc region mask
+                region_length = len(region_tokens)
+                regions = get_sublists(list(prompt_tokens), region_tokens)
 
-            region_mask = np.zeros(len(prompt_tokens))
-            for r in regions:
-                region_mask[r:r+region_length] = 1
-            region_mask = region_mask.reshape(-1,tokenizer.max_length-2)
-            region_mask = np.pad(region_mask, pad_width=((0,0),(1,1)), mode='constant', constant_values=0)
-            region_mask = region_mask.reshape(1, -1)
-            region_outputs.append(region_mask)
+                region_mask = np.zeros(len(prompt_tokens))
+                for r in regions:
+                    region_mask[r:r+region_length] = 1
+                region_mask = region_mask.reshape(-1,tokenizer.max_length-2)
+                region_mask = np.pad(region_mask, pad_width=((0,0),(1,1)), mode='constant', constant_values=0)
+                region_mask = region_mask.reshape(1, -1)
+                region_outputs.append(region_mask)
 
-            #calc target mask
-            targets = []
-            for target in target_text.split(" "):
-                # deal with underscores
-                target = re.sub(r"(?<!\\)_", " ", target)
-                target = re.sub(r"\\_", "_", target)
+                #calc target mask
+                targets = []
+                for target in target_text.split(" "):
+                    # deal with underscores
+                    target = re.sub(r"(?<!\\)_", " ", target)
+                    target = re.sub(r"\\_", "_", target)
 
-                target_tokens = tokenizer.tokenize_with_weights(target)
-                target_tokens, _ = replace_embeddings(endtoken, target_tokens, emb_lookup)
-                target_tokens = unpad_prompt(endtoken, target_tokens).tolist()
+                    target_tokens = tokenizer.tokenize_with_weights(target)
+                    target_tokens, _ = replace_embeddings(endtoken, target_tokens, emb_lookup)
+                    target_tokens = unpad_prompt(endtoken, target_tokens).tolist()
 
-                targets.extend([(x, len(target_tokens)) for x in get_sublists(region_tokens, target_tokens)])
-            targets = [(t_start + r, t_start + t_end + r) for r in regions for t_start, t_end in targets]
+                    targets.extend([(x, len(target_tokens)) for x in get_sublists(region_tokens, target_tokens)])
+                targets = [(t_start + r, t_start + t_end + r) for r in regions for t_start, t_end in targets]
 
-            targets_mask = np.zeros(len(prompt_tokens))
-            for t_start, t_end in targets:
-                targets_mask[t_start: t_end] = 1
-            targets_mask = targets_mask.reshape(-1,tokenizer.max_length-2)
-            targets_mask = np.pad(targets_mask, pad_width=((0,0),(1,1)), mode='constant', constant_values=0)
-            targets_mask = targets_mask.reshape(1,-1)
-            target_outputs.append(targets_mask)
+                targets_mask = np.zeros(len(prompt_tokens))
+                for t_start, t_end in targets:
+                    targets_mask[t_start: t_end] = 1
+                targets_mask = targets_mask.reshape(-1,tokenizer.max_length-2)
+                targets_mask = np.pad(targets_mask, pad_width=((0,0),(1,1)), mode='constant', constant_values=0)
+                targets_mask = targets_mask.reshape(1,-1)
+                target_outputs.append(targets_mask)
 
         #prepare output
         region_mask_list = clip_regions['regions'].copy()
